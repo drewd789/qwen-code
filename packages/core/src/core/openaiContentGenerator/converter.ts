@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as fs from 'fs';
 import type {
   GenerateContentParameters,
   Part,
@@ -27,6 +28,18 @@ import {
   convertSchema,
   type SchemaComplianceMode,
 } from '../../utils/schemaConverter.js';
+
+const LOG_FILE = '/tmp/tool-call-debug.log';
+function converterLog(msg: string) {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] [CONVERTER] ${msg}\n`;
+  console.log(line.trim());
+  try {
+    fs.appendFileSync(LOG_FILE, line);
+  } catch (e) {
+    // Ignore file write errors
+  }
+}
 
 const debugLogger = createDebugLogger('CONVERTER');
 
@@ -131,6 +144,7 @@ export class OpenAIContentConverter {
    * data pollution from previous incomplete streams
    */
   resetStreamingToolCalls(): void {
+    converterLog('resetStreamingToolCalls called');
     this.streamingToolCallParser.reset();
   }
 
@@ -949,11 +963,17 @@ export class OpenAIContentConverter {
 
       // Handle tool calls using the streaming parser
       if (choice.delta?.tool_calls) {
+        converterLog(`Processing ${choice.delta.tool_calls.length} tool call chunks`);
         for (const toolCall of choice.delta.tool_calls) {
           const index = toolCall.index ?? 0;
+          const hasArgs = !!toolCall.function?.arguments;
+          const hasName = !!toolCall.function?.name;
+          const hasId = !!toolCall.id;
+          converterLog(`  toolCall: index=${index}, hasId=${hasId}, hasName=${hasName}, hasArgs=${hasArgs}`);
 
           // Process the tool call chunk through the streaming parser
           if (toolCall.function?.arguments) {
+            converterLog(`  -> Calling addChunk with arguments`);
             this.streamingToolCallParser.addChunk(
               index,
               toolCall.function.arguments,
@@ -961,6 +981,7 @@ export class OpenAIContentConverter {
               toolCall.function.name,
             );
           } else {
+            converterLog(`  -> Calling addChunk metadata-only`);
             // Handle metadata-only chunks (id and/or name without arguments)
             this.streamingToolCallParser.addChunk(
               index,
@@ -975,16 +996,20 @@ export class OpenAIContentConverter {
       // Only emit function calls when streaming is complete (finish_reason is present)
       let toolCallsTruncated = false;
       if (choice.finish_reason) {
+        converterLog(`finish_reason=${choice.finish_reason}, emitting tool calls`);
         // Detect truncation the provider may not report correctly.
         // Some providers (e.g. DashScope/Qwen) send "stop" or "tool_calls"
         // even when output was cut off mid-JSON due to max_tokens.
         toolCallsTruncated =
           this.streamingToolCallParser.hasIncompleteToolCalls();
+        converterLog(`  toolCallsTruncated=${toolCallsTruncated}`);
 
         const completedToolCalls =
           this.streamingToolCallParser.getCompletedToolCalls();
+        converterLog(`  getCompletedToolCalls returned ${completedToolCalls.length} tool calls`);
 
         for (const toolCall of completedToolCalls) {
+          converterLog(`  Emitting tool call: id=${toolCall.id || 'none'}, name=${toolCall.name || 'none'}`);
           if (toolCall.name) {
             parts.push({
               functionCall: {
@@ -999,6 +1024,7 @@ export class OpenAIContentConverter {
         }
 
         // Clear the parser for the next stream
+        converterLog(`  Resetting streaming parser`);
         this.streamingToolCallParser.reset();
       }
 

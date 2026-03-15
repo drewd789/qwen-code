@@ -277,6 +277,17 @@ export class Turn {
         const resp = streamEvent.value as GenerateContentResponse;
         if (!resp) continue; // Skip if there's no response body
 
+        const parts = resp.candidates?.[0]?.content?.parts || [];
+        const toolCallCount = parts.filter(p => 'functionCall' in p).length;
+        console.log(`[TURN] Received response: ${parts.length} parts, ${toolCallCount} tool calls`);
+        if (toolCallCount > 0) {
+          parts.forEach((p, i) => {
+            if ('functionCall' in p && p.functionCall) {
+              console.log(`[TURN]   Tool call ${i}: ${p.functionCall.name || 'NO NAME'}`);
+            }
+          });
+        }
+
         this.debugResponses.push(resp);
 
         // Track the current response ID for tool call correlation

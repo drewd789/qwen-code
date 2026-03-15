@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as fs from 'fs';
 import type OpenAI from 'openai';
 import {
   type GenerateContentParameters,
@@ -15,6 +16,18 @@ import type { ContentGeneratorConfig } from '../contentGenerator.js';
 import type { OpenAICompatibleProvider } from './provider/index.js';
 import { OpenAIContentConverter } from './converter.js';
 import type { ErrorHandler, RequestContext } from './errorHandler.js';
+
+const LOG_FILE = '/tmp/tool-call-debug.log';
+function pipelineLog(msg: string) {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] [PIPELINE] ${msg}\n`;
+  console.log(line.trim());
+  try {
+    fs.appendFileSync(LOG_FILE, line);
+  } catch (e) {
+    // Ignore file write errors
+  }
+}
 
 /**
  * Error thrown when the API returns an error embedded as stream content
