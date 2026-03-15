@@ -231,3 +231,104 @@ getCompletedToolCalls(): [{ id: 'call_abc', name: 'write_file', args: {...} }]
    - Converter fix: Emit during streaming + track by ID
 4. **Test with adversarial chunk ordering** - Most tests assume chunks arrive in logical order
 5. **Streaming requires careful state management** - Emission timing matters when chunks arrive out of order
+
+---
+
+## Second Bug Discovered: Pipeline Finish Chunk Overwriting
+
+### The Bug Location
+`packages/core/src/core/openaiContentGenerator/pipeline.ts` - `handleChunkMerging()`
+
+### The Bug Mechanism
+
+When the API sends TWO finish_reason chunks:
+1. First finish chunk arrives WITH tool calls → stored in `pendingFinishResponse`
+2. Second finish chunk arrives WITHOUT tool calls → **OVERWRITES** the first one
+3. Stage 2d yields the second (empty) finish response → tool calls lost
+
+```
+Chunk 1 (finish_reason=tool_calls, 3 tool calls):
+  → handleChunkMerging stores in pendingFinishResponse
+  → shouldYield=false (hold for merging)
+
+Chunk 2 (finish_reason=tool_calls, 0 tool calls):
+  → handleChunkMerging OVERWRITES pendingFinishResponse
+  → shouldYield=false (hold for merging)
+
+Stage 2d yields pendingFinishResponse:
+  → Contains 0 tool calls (the second chunk)
+  → Original 3 tool calls are LOST
+```
+
+### The Flawed Logic
+
+In `handleChunkMerging()` (before fix):
+
+```typescript
+if (isFinishChunk) {
+  // This is a finish reason chunk
+  collectedGeminiResponses.push(response);  // ← OVERWRITES previous finish!
+  setPendingFinish(response);
+  return false;
+}
+```
+
+The code unconditionally stored every finish chunk, even if a previous finish chunk already had tool calls.
+
+### The Fix
+
+Skip finish chunks that don't have tool calls when the pending finish already has them:
+
+```typescript
+if (isFinishChunk) {
+  // Don't overwrite a pending finish that already has tool calls
+  const lastCollected = collectedGeminiResponses[collectedGeminiResponses.length - 1];
+  const pendingToolCallCount = lastCollected?.candidates?.[0]?.content?.parts
+    ?.filter((p: Part) => 'functionCall' in p).length || 0;
+  if (hasPendingFinish && pendingToolCallCount > 0 && !hasToolCalls) {
+    return false;  // Skip this finish chunk
+  }
+  collectedGeminiResponses.push(response);
+  setPendingFinish(response);
+  return false;
+}
+```
+
+### Observed Pattern in Logs
+
+```
+[CONVERTER]   getCompletedToolCalls returned 3 tool calls
+[CONVERTER]   Emitting tool call: id=call_xxx, name=glob
+[CONVERTER]   Emitting tool call: id=call_yyy, name=glob
+[CONVERTER]   Emitting tool call: id=call_zzz, name=glob
+[PIPELINE] Stage 2d: YIELDING final pending finish response with 0 parts (0 tool calls)
+```
+
+The converter emitted 3 tool calls into the first finish chunk, but the pipeline yielded a finish response with 0 tool calls because the second finish chunk overwrote the first.
+
+### Why This Bug Was Missed
+
+1. **Requires specific provider behavior** - Only providers that send finish_reason twice trigger this
+2. **Symptom looks like other bugs** - Tool calls disappearing could be parser bug, converter bug, or pipeline bug
+3. **Logging revealed the issue** - Only with detailed pipeline logging did we see the second finish chunk overwriting the first
+
+---
+
+## Complete Solution: Three Complementary Fixes
+
+The two bugs are **complementary** - they address different failure modes:
+
+| Failure Mode | Fix 1 (Parser) | Fix 2 (Converter) | Fix 3 (Pipeline) |
+|--------------|----------------|-------------------|------------------|
+| Name arrives AFTER JSON completes → parser reassigns index | ✅ Fixes | ✅ Mitigates | ❌ No effect |
+| Two finish chunks → second overwrites first | ❌ No effect | ❌ No effect | ✅ Fixes |
+
+### Fix Summary
+
+| File | Change | Purpose |
+|------|--------|---------|
+| `streamingToolCallParser.ts` | Check `meta.name` in completeness checks | Prevents index reassignment when name arrives late |
+| `converter.ts` | Emit during streaming + track emitted IDs | Emits tool calls immediately, prevents duplicates |
+| `pipeline.ts` | Skip finish chunks without tool calls | Prevents second finish chunk from overwriting first |
+
+All three fixes work together for comprehensive tool call reliability.
